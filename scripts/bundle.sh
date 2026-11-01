@@ -13,11 +13,18 @@ BUNDLE_ID="${BUNDLE_ID:-com.majnioui.rackip}"
 VERSION=$(cat VERSION)
 APP=build/RackIP.app
 
-swift build -c release --product rackip
+# Universal binary (Apple Silicon + Intel). Built per architecture and joined
+# with lipo, which works with only the Command Line Tools installed.
+BINS=""
+for arch in arm64 x86_64; do
+    swift build -c release --product rackip --triple "$arch-apple-macosx13.0"
+    BINS="$BINS $(swift build -c release --triple "$arch-apple-macosx13.0" --show-bin-path)/rackip"
+done
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$(swift build -c release --show-bin-path)/rackip" "$APP/Contents/MacOS/rackip"
+# shellcheck disable=SC2086
+lipo -create $BINS -output "$APP/Contents/MacOS/rackip"
 [ -f assets/AppIcon.icns ] || swift scripts/make-icon.swift assets
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 

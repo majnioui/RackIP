@@ -29,8 +29,14 @@ thing from one small window or from the menu bar.
 
 ## Install
 
-Requires macOS 13 or later and the Xcode Command Line Tools
-(`xcode-select --install`).
+Download `RackIP-x.y.z.dmg` from
+[Releases](https://github.com/majnioui/RackIP/releases/latest), open it and
+drag RackIP to Applications. Requires macOS 13 or later, on Apple Silicon or
+Intel.
+
+### Build from source
+
+Requires the Xcode Command Line Tools (`xcode-select --install`).
 
 ```sh
 git clone https://github.com/majnioui/RackIP.git
@@ -62,7 +68,8 @@ Saved addresses are stored in the app's preferences
 ```sh
 swift build                 # debug build
 swift run core-checks       # address validation + networksetup parsing checks
-scripts/bundle.sh           # release .app (ad-hoc signed)
+scripts/bundle.sh           # release .app (universal, ad-hoc signed)
+scripts/dmg.sh              # build/RackIP-<version>.dmg
 ```
 
 - `Sources/RackIPCore`: validation and output parsing, with no UI code.
