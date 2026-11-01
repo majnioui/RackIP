@@ -1,0 +1,93 @@
+name: Release
+
+# Push a tag like v0.2.0 to build every platform and attach the downloads to
+# that GitHub release (created if it does not exist yet).
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift run core-checks
+      - run: scripts/dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: build/RackIP-*.dmg
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows-linux
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test
+      - name: Read adapters on a real Windows machine
+        run: cargo run -- --list
+      - run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p ../dist
+          cp target/release/rackip.exe "../dist/RackIP-$(cat ../VERSION)-windows-x64.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  linux:
+    # Oldest supported runner, so the binary runs on older distributions too.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: windows-linux
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libwayland-dev
+      - run: cargo test
+      - run: cargo build --release
+      - name: Package AppImage and tarball
+        run: |
+          VERSION=$(cat ../VERSION)
+          mkdir -p ../dist
+          APPDIR=$(mktemp -d)/RackIP.AppDir
+          mkdir -p "$APPDIR/usr/bin"
+          cp target/release/rackip "$APPDIR/usr/bin/"
+          cp packaging/rackip.desktop "$APPDIR/"
+          cp ../assets/icon.png "$APPDIR/rackip.png"
+          ln -s usr/bin/rackip "$APPDIR/AppRun"
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool "$APPDIR" "../dist/RackIP-$VERSION-linux-x86_64.AppImage"
+          tar -czf "../dist/RackIP-$VERSION-linux-x86_64.tar.gz" -C target/release rackip -C ../../packaging rackip.desktop -C ../../assets icon.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "RackIP ${TAG#v}" --notes ""
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber

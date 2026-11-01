@@ -1,4 +1,5 @@
-// Draws AppIcon.icns:  swift scripts/make-icon.swift assets
+// Draws AppIcon.icns (macOS), icon.ico (Windows) and icon.png (README, Linux):
+//   swift scripts/make-icon.swift assets
 import AppKit
 
 let outDir = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "assets"
@@ -64,4 +65,22 @@ let p = Process()
 p.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
 p.arguments = ["-c", "icns", iconset.path, "-o", "\(outDir)/AppIcon.icns"]
 try! p.run(); p.waitUntilExit()
-print("Wrote \(outDir)/AppIcon.icns")
+
+try! render(512).write(to: URL(fileURLWithPath: "\(outDir)/icon.png"))
+
+// ICO with PNG-compressed entries (supported since Windows Vista).
+let icoSizes = [16, 24, 32, 48, 64, 128, 256]
+let images = icoSizes.map(render)
+var ico = Data([0, 0, 1, 0, UInt8(icoSizes.count), 0])
+var offset = 6 + 16 * icoSizes.count
+func le16(_ v: Int) -> [UInt8] { [UInt8(v & 0xFF), UInt8(v >> 8 & 0xFF)] }
+func le32(_ v: Int) -> [UInt8] { le16(v & 0xFFFF) + le16(v >> 16) }
+for (size, png) in zip(icoSizes, images) {
+    let dim = UInt8(size == 256 ? 0 : size)
+    ico.append(contentsOf: [dim, dim, 0, 0] + le16(1) + le16(32) + le32(png.count) + le32(offset))
+    offset += png.count
+}
+images.forEach { ico.append($0) }
+try! ico.write(to: URL(fileURLWithPath: "\(outDir)/icon.ico"))
+
+print("Wrote \(outDir)/AppIcon.icns, icon.ico, icon.png")

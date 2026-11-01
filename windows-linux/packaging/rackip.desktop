@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RackIP
+Comment=Switch the static IP of an Ethernet port
+Exec=rackip
+Icon=rackip
+Categories=Network;Utility;
+Terminal=false
