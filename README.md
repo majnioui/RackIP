@@ -14,6 +14,10 @@
   &nbsp;·&nbsp; macOS &nbsp;·&nbsp; Windows &nbsp;·&nbsp; Linux &nbsp;·&nbsp; Free and open source
 </p>
 
+<p align="center">
+  <img src="assets/screenshot.png" width="460" alt="RackIP window on macOS: port picker, saved address, IP, subnet mask and gateway fields, with Use DHCP, Save and Apply buttons">
+</p>
+
 ---
 
 When you plug a laptop into a server's management or service port, your
