@@ -1,6 +1,6 @@
 [package]
 name = "rackip"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Switch the static IP of an Ethernet port in one click"
 license = "MIT"
