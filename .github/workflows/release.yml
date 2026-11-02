@@ -42,7 +42,7 @@ jobs:
           cp target/release/rackip.exe "../dist/RackIP-$VERSION-windows-x64.exe"
           # Chrome blocks rarely downloaded unsigned .exe files but lets a .zip through.
           mkdir -p zip && cp target/release/rackip.exe zip/RackIP.exe
-          7z a "../dist/RackIP-$VERSION-windows-x64.zip" ./zip/RackIP.exe
+          (cd zip && 7z a "../../dist/RackIP-$VERSION-windows-x64.zip" RackIP.exe)
       - uses: actions/upload-artifact@v4
         with:
           name: windows
