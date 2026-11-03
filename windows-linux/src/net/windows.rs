@@ -2,9 +2,83 @@
 //! the system language), change with `netsh` (needs administrator rights,
 //! which the app's manifest requests at launch).
 
-use super::{run, Adapter, Mode};
+use super::{foreign_server_message, run, server_address, Adapter, DhcpServer, Mode};
 use crate::config::{parse_ipv4, ManualConfig};
+use crate::dhcp::{server::Server, DhcpConfig, Lease};
 use serde::{Deserialize, Deserializer};
+use std::io::ErrorKind;
+use std::time::Duration;
+
+const FIREWALL_RULE: &str = "name=RackIP-DHCP-server";
+
+/// Runs the server in-process, bound to the port's own address: Windows
+/// delivers broadcasts from that port to the socket and sends replies out of it.
+pub fn start_dhcp(adapter: &Adapter, config: &DhcpConfig) -> Result<Box<dyn DhcpServer>, String> {
+    set_static(adapter, &server_address(config))?;
+    // Inbound DHCP is blocked by default; open it only while the server runs.
+    let _ = run("netsh.exe", &["advfirewall", "firewall", "delete", "rule", FIREWALL_RULE]);
+    let firewall = netsh(&[
+        "advfirewall", "firewall", "add", "rule", FIREWALL_RULE,
+        "dir=in", "action=allow", "protocol=UDP", "localport=67",
+    ])
+    .is_ok();
+    // The new address takes a moment to come up, and only does once the port has link.
+    let mut last = None;
+    for _ in 0..20 {
+        match Server::start(config.server, config.clone()) {
+            Ok(server) => return Ok(Box::new(WindowsServer { server, firewall })),
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                last = Some(e);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    remove_firewall_rule(firewall);
+    Err(match last {
+        Some(e) if e.kind() == ErrorKind::AddrInUse => {
+            "Port 67 is already in use: another DHCP server or Internet Connection Sharing is running on this PC.".into()
+        }
+        Some(e) if e.kind() == ErrorKind::AddrNotAvailable => format!(
+            "{} is not up on {} yet. Plug the cable in: Windows only brings the address up when the port has link.",
+            config.server, adapter.name
+        ),
+        Some(e) => format!("Could not start the DHCP server: {e}"),
+        None => "Could not start the DHCP server.".into(),
+    })
+}
+
+fn remove_firewall_rule(added: bool) {
+    if added {
+        let _ = run("netsh.exe", &["advfirewall", "firewall", "delete", "rule", FIREWALL_RULE]);
+    }
+}
+
+struct WindowsServer {
+    server: Server,
+    firewall: bool,
+}
+
+impl DhcpServer for WindowsServer {
+    fn leases(&mut self) -> Vec<Lease> {
+        self.server.leases()
+    }
+
+    fn problem(&self) -> Option<String> {
+        if let Some(other) = self.server.foreign_server() {
+            return Some(foreign_server_message(other));
+        }
+        (!self.firewall).then(|| "Could not open port 67 in Windows Firewall, so devices may get no answer.".into())
+    }
+
+    fn stop(self: Box<Self>) -> Result<(), String> {
+        let firewall = self.firewall;
+        drop(self.server);
+        remove_firewall_rule(firewall);
+        Ok(())
+    }
+}
 
 const SCRIPT: &str = r#"
 [Console]::OutputEncoding = [Text.Encoding]::UTF8

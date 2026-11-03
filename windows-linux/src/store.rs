@@ -44,6 +44,17 @@ pub struct Store {
     pub selected_adapter: Option<String>,
     #[serde(default)]
     pub show_all: bool,
+    /// DHCP server fields as typed; empty means the default.
+    #[serde(default)]
+    pub dhcp_server: String,
+    #[serde(default)]
+    pub dhcp_mask: String,
+    #[serde(default)]
+    pub dhcp_start: String,
+    #[serde(default)]
+    pub dhcp_end: String,
+    #[serde(default)]
+    pub dhcp_lease: String,
 }
 
 impl Store {

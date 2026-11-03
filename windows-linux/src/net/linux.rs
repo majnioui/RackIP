@@ -4,8 +4,93 @@
 //! so the user's own profiles are never edited. Going back to DHCP deletes it
 //! and lets NetworkManager reconnect the device the way it did before.
 
-use super::{run, Adapter, Mode};
+use super::{run, Adapter, DhcpServer, Mode};
 use crate::config::{parse_ipv4, ManualConfig};
+use crate::dhcp::{DhcpConfig, Lease};
+use std::time::{Duration, Instant};
+
+/// NetworkManager's "shared" mode runs dnsmasq for the port, so the app needs
+/// no root rights. It also offers this computer as gateway and DNS.
+pub fn start_dhcp(adapter: &Adapter, config: &DhcpConfig) -> Result<Box<dyn DhcpServer>, String> {
+    let profile = profile_name(adapter);
+    ensure_profile(adapter, &profile)?;
+    let addresses = format!("{}/{}", config.server, config.prefix);
+    let range = format!("{},{}", config.start, config.end);
+    let lease = config.lease_secs.to_string();
+    let base = [
+        "connection", "modify", profile.as_str(),
+        "ipv4.method", "shared",
+        "ipv4.addresses", addresses.as_str(),
+        "ipv4.gateway", "",
+        "connection.autoconnect", "yes",
+        "connection.autoconnect-priority", "100",
+    ];
+    let mut with_range = base.to_vec();
+    with_range.extend(["ipv4.shared-dhcp-range", range.as_str(), "ipv4.shared-dhcp-lease-time", lease.as_str()]);
+    let mut note = None;
+    if run("nmcli", &with_range).is_err() {
+        // Range and lease time arrived in NetworkManager 1.42.
+        run("nmcli", &base)?;
+        note = Some("This NetworkManager is older than 1.42, so it picks the range and lease time itself.".to_string());
+    }
+    if let Err(e) = run("nmcli", &["connection", "up", &profile, "ifname", &adapter.id]) {
+        let _ = run("nmcli", &["connection", "modify", &profile, "ipv4.method", "manual"]);
+        return Err(if e.to_lowercase().contains("dnsmasq") {
+            "The DHCP server needs dnsmasq. Install it (package dnsmasq-base or dnsmasq) and try again.".into()
+        } else {
+            e
+        });
+    }
+    Ok(Box::new(SharedServer { device: adapter.id.clone(), profile, note, leases: Vec::new(), read_at: None }))
+}
+
+struct SharedServer {
+    device: String,
+    profile: String,
+    note: Option<String>,
+    leases: Vec<Lease>,
+    read_at: Option<Instant>,
+}
+
+impl DhcpServer for SharedServer {
+    fn leases(&mut self) -> Vec<Lease> {
+        if self.read_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            let path = format!("/var/lib/NetworkManager/dnsmasq-{}.leases", self.device);
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            self.leases = parse_dnsmasq_leases(&text, crate::store::now());
+            self.read_at = Some(Instant::now());
+        }
+        self.leases.clone()
+    }
+
+    fn problem(&self) -> Option<String> {
+        self.note.clone()
+    }
+
+    fn stop(self: Box<Self>) -> Result<(), String> {
+        run("nmcli", &["connection", "modify", &self.profile, "ipv4.method", "manual"])?;
+        run("nmcli", &["connection", "up", &self.profile, "ifname", &self.device]).map(|_| ())
+    }
+}
+
+/// dnsmasq lease lines: `<expiry> <mac> <ip> <hostname or *> <client id>`.
+pub(crate) fn parse_dnsmasq_leases(text: &str, now: u64) -> Vec<Lease> {
+    let mut list: Vec<Lease> = text
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let expires: u64 = f.next()?.parse().ok()?;
+            let mac = f.next()?.to_lowercase();
+            let ip = parse_ipv4(f.next()?)?;
+            let hostname = f.next().filter(|h| *h != "*").unwrap_or("").to_string();
+            // 0 means the lease never expires.
+            let expires = if expires == 0 { u64::MAX } else { expires };
+            (expires > now).then_some(Lease { mac, ip, hostname, expires, bound: true })
+        })
+        .collect();
+    list.sort_by(|a, b| b.expires.cmp(&a.expires));
+    list
+}
 
 pub fn adapters() -> Result<Vec<Adapter>, String> {
     let status = run("nmcli", &["-t", "-e", "yes", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"])
@@ -147,6 +232,18 @@ pub(crate) fn adapter_from(device: &str, kind: &str, state: &str, connection: &s
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn dnsmasq_leases() {
+        let text = "1700000600 AA:BB:CC:DD:EE:01 10.42.0.23 idrac 01:aa:bb:cc:dd:ee:01\n\
+                    1700000100 aa:bb:cc:dd:ee:02 10.42.0.24 * *\n\
+                    1699999000 aa:bb:cc:dd:ee:03 10.42.0.25 old *\n\
+                    garbage\n";
+        let l = parse_dnsmasq_leases(text, 1_700_000_000);
+        assert_eq!(l.len(), 2);
+        assert_eq!((l[0].mac.as_str(), l[0].ip, l[0].hostname.as_str()), ("aa:bb:cc:dd:ee:01", Ipv4Addr::new(10, 42, 0, 23), "idrac"));
+        assert_eq!(l[1].hostname, "");
+    }
 
     #[test]
     fn terse_split() {

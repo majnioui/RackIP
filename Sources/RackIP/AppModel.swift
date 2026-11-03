@@ -33,6 +33,27 @@ final class AppModel: ObservableObject {
     @Published private(set) var profiles: [Profile] = ProfileStore.load()
     @Published private(set) var selectedProfileID: UUID?
 
+    // DHCP server. The fields are kept as typed; empty means the placeholder default.
+    @Published var dhcpServer = UserDefaults.standard.string(forKey: "dhcpServer") ?? "" {
+        didSet { UserDefaults.standard.set(dhcpServer, forKey: "dhcpServer") }
+    }
+    @Published var dhcpMask = UserDefaults.standard.string(forKey: "dhcpMask") ?? "" {
+        didSet { UserDefaults.standard.set(dhcpMask, forKey: "dhcpMask") }
+    }
+    @Published var dhcpRangeStart = UserDefaults.standard.string(forKey: "dhcpRangeStart") ?? "" {
+        didSet { UserDefaults.standard.set(dhcpRangeStart, forKey: "dhcpRangeStart") }
+    }
+    @Published var dhcpRangeEnd = UserDefaults.standard.string(forKey: "dhcpRangeEnd") ?? "" {
+        didSet { UserDefaults.standard.set(dhcpRangeEnd, forKey: "dhcpRangeEnd") }
+    }
+    @Published var dhcpLeaseMinutes = UserDefaults.standard.string(forKey: "dhcpLeaseMinutes") ?? "" {
+        didSet { UserDefaults.standard.set(dhcpLeaseMinutes, forKey: "dhcpLeaseMinutes") }
+    }
+    /// The port the server runs on, nil when stopped.
+    @Published private(set) var dhcpServiceName: String?
+    @Published private(set) var dhcpLeases: [DHCPLease] = []
+    private var dhcpServerTask: DHCPServer?
+
     @Published var status: Status?
     @Published private(set) var isBusy = false
 
@@ -69,6 +90,18 @@ final class AppModel: ObservableObject {
         ManualConfig.parse(address: address, mask: mask, gateway: gateway)
     }
 
+    var parsedDHCP: Result<DHCPConfig, DHCPConfigError> {
+        DHCPConfig.parse(server: dhcpServer, mask: dhcpMask, rangeStart: dhcpRangeStart, rangeEnd: dhcpRangeEnd, leaseMinutes: dhcpLeaseMinutes)
+    }
+
+    /// What the empty range fields stand for, given the server address and mask typed so far.
+    var dhcpDefaults: DHCPConfig? {
+        if case .success(let c) = DHCPConfig.parse(server: dhcpServer, mask: dhcpMask, rangeStart: "", rangeEnd: "", leaseMinutes: "") { return c }
+        return nil
+    }
+
+    var isDHCPRunning: Bool { dhcpServiceName != nil }
+
     // MARK: Refresh
 
     func refresh() async {
@@ -101,7 +134,7 @@ final class AppModel: ObservableObject {
         }
         // Leave the name field empty when it is just the IP, so editing the IP renames it too.
         name = p.isNamedAfterAddress ? "" : p.name; address = p.address; mask = p.mask; gateway = p.gateway
-        if let svc = p.service, services.contains(where: { $0.name == svc }) {
+        if !isDHCPRunning, let svc = p.service, services.contains(where: { $0.name == svc }) {
             selectedServiceName = svc
         }
     }
@@ -148,6 +181,7 @@ final class AppModel: ObservableObject {
             status = Status(kind: .error, text: "Choose a network port first.")
             return
         }
+        guard !blockedByDHCPServer() else { return }
         let config: ManualConfig
         switch parsedForm {
         case .failure(let e): status = Status(kind: .error, text: e.description); return
@@ -165,7 +199,7 @@ final class AppModel: ObservableObject {
 
     /// Menu bar quick-apply.
     func apply(_ profile: Profile) {
-        if let svc = profile.service, services.contains(where: { $0.name == svc }) {
+        if !isDHCPRunning, let svc = profile.service, services.contains(where: { $0.name == svc }) {
             selectedServiceName = svc
         }
         selectProfile(profile.id)
@@ -173,10 +207,78 @@ final class AppModel: ObservableObject {
     }
 
     func useDHCP() {
-        guard let service = selectedServiceName else { return }
+        guard let service = selectedServiceName, !blockedByDHCPServer() else { return }
         perform("Switching \(service) to DHCP…", warnings: []) {
             try NetworkSetup.setDHCP(service: service)
         } success: { "\(service) is back on DHCP (automatic)." }
+    }
+
+    private func blockedByDHCPServer() -> Bool {
+        guard let running = dhcpServiceName else { return false }
+        status = Status(kind: .error, text: "The DHCP server is running on \(running). Stop it first to change the address.")
+        return true
+    }
+
+    // MARK: DHCP server
+
+    func startDHCP() {
+        guard !isBusy, !isDHCPRunning else { return }
+        guard let service = selectedService, !service.device.isEmpty else {
+            status = Status(kind: .error, text: "Choose a network port first.")
+            return
+        }
+        let config: DHCPConfig
+        switch parsedDHCP {
+        case .failure(let e): status = Status(kind: .error, text: e.description); return
+        case .success(let c): config = c
+        }
+        // An address from DHCP means a server already runs on this cable. A second one would fight it.
+        if currentInfo?.mode == .dhcp, let ip = currentInfo?.address, ip.value >> 16 != 0xA9FE {
+            status = Status(kind: .error, text: "\(service.name) already got \(ip) from a DHCP server on this network. RackIP won't start a second one here, it would hand out conflicting addresses.")
+            return
+        }
+        guard case .success(let manual) = ManualConfig.parse(address: config.server.description, mask: config.mask.description, gateway: "") else { return }
+
+        isBusy = true
+        status = Status(kind: .info, text: "Starting the DHCP server on \(service.name)…")
+        Task {
+            let error = await Task.detached { () -> String? in
+                do { try NetworkSetup.setManual(service: service.name, config: manual); return nil } catch { return error.localizedDescription }
+            }.value
+            isBusy = false
+            if let error {
+                status = Status(kind: .error, text: error)
+                return
+            }
+            do {
+                let server = try DHCPServer(device: service.device, config: config)
+                server.onChange = { [weak self, weak server] leases, foreign in
+                    guard let self, let server, self.dhcpServerTask === server else { return }
+                    self.dhcpLeases = leases
+                    if let foreign {
+                        self.status = Status(kind: .warning, text: "Another DHCP server (\(foreign)) answered on this cable. RackIP stopped handing out addresses so the two don't conflict.")
+                    }
+                }
+                server.start()
+                dhcpServerTask = server
+                dhcpServiceName = service.name
+                dhcpLeases = []
+                status = Status(kind: .success, text: "DHCP server running on \(service.name) (\(config.server)/\(config.prefix)), handing out \(config.rangeStart) to \(config.rangeEnd).")
+            } catch {
+                status = Status(kind: .error, text: error.localizedDescription)
+            }
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            await refresh()
+        }
+    }
+
+    func stopDHCP() {
+        guard let service = dhcpServiceName else { return }
+        dhcpServerTask?.stop()
+        dhcpServerTask = nil
+        dhcpServiceName = nil
+        dhcpLeases = []
+        status = Status(kind: .success, text: "DHCP server stopped. \(service) keeps its address.")
     }
 
     private func perform(_ progress: String, warnings: [String],

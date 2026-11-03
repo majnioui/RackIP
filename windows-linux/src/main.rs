@@ -2,15 +2,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod dhcp;
 mod net;
 mod store;
 
 use config::{mask_from_prefix, ManualConfig, DEFAULT_PREFIX};
+use dhcp::{DhcpConfig, Lease};
 use eframe::egui::{self, Color32, RichText};
 use net::{Adapter, Mode};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use store::{Profile, Store};
 
 const GREEN: Color32 = Color32::from_rgb(52, 199, 89);
@@ -118,8 +120,10 @@ fn setup_style(ctx: &egui::Context) {
         v.panel_fill = if dark { Color32::from_gray(32) } else { Color32::from_gray(250) };
         v.window_fill = if dark { Color32::from_gray(44) } else { Color32::WHITE };
         v.extreme_bg_color = if dark { Color32::from_gray(28) } else { Color32::WHITE };
-        v.selection.bg_fill = ACCENT;
-        v.selection.stroke.color = if dark { Color32::from_rgb(96, 170, 255) } else { ACCENT };
+        // A tinted highlight: the stroke color is also the text of the selected
+        // dropdown item, so it has to stand out against the fill.
+        v.selection.bg_fill = if dark { Color32::from_rgb(0, 60, 120) } else { Color32::from_rgb(204, 228, 255) };
+        v.selection.stroke.color = if dark { Color32::from_rgb(150, 200, 255) } else { ACCENT };
         v.hyperlink_color = v.selection.stroke.color;
         let field_stroke = if dark { Color32::from_gray(70) } else { Color32::from_gray(205) };
         for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
@@ -254,6 +258,25 @@ struct Ports {
 type Job = (Receiver<Result<(), String>>, String, Vec<String>);
 
 #[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    StaticIp,
+    Dhcp,
+    About,
+}
+
+/// The DHCP server while it runs.
+struct RunningDhcp {
+    server: Box<dyn net::DhcpServer>,
+    adapter: String,
+    leases: Vec<Lease>,
+    polled: Instant,
+    problem: Option<String>,
+}
+
+/// A DHCP server being started in the background: its result, the port name and the config.
+type DhcpJob = (Receiver<Result<Box<dyn net::DhcpServer>, String>>, String, DhcpConfig);
+
+#[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Info,
     Success,
@@ -272,6 +295,25 @@ struct App {
     gateway: String,
     status: Option<(Kind, String)>,
     job: Option<Job>,
+    tab: Tab,
+    icon: Option<egui::TextureHandle>,
+    dhcp_server: String,
+    dhcp_mask: String,
+    dhcp_start: String,
+    dhcp_end: String,
+    dhcp_lease: String,
+    dhcp: Option<RunningDhcp>,
+    dhcp_job: Option<DhcpJob>,
+}
+
+impl Drop for App {
+    // Linux keeps NetworkManager's shared mode after the app quits, and Windows
+    // the firewall rule, so stop the server on the way out.
+    fn drop(&mut self) {
+        if let Some(running) = self.dhcp.take() {
+            let _ = running.server.stop();
+        }
+    }
 }
 
 impl App {
@@ -302,10 +344,18 @@ impl App {
                 }
             });
         }
+        let store = Store::load();
         App {
             ports,
             refresh,
-            store: Store::load(),
+            dhcp_server: store.dhcp_server.clone(),
+            dhcp_mask: store.dhcp_mask.clone(),
+            dhcp_start: store.dhcp_start.clone(),
+            dhcp_end: store.dhcp_end.clone(),
+            dhcp_lease: store.dhcp_lease.clone(),
+            dhcp: None,
+            dhcp_job: None,
+            store,
             selected_profile: None,
             name: String::new(),
             address: String::new(),
@@ -313,11 +363,20 @@ impl App {
             gateway: String::new(),
             status: None,
             job: None,
+            tab: Tab::StaticIp,
+            icon: None,
         }
     }
 
     fn busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.dhcp_job.is_some()
+    }
+
+    /// Changing the port's address would pull it from under the server.
+    fn blocked_by_dhcp(&mut self) -> bool {
+        let Some(running) = &self.dhcp else { return false };
+        self.status = Some((Kind::Error, format!("The DHCP server is running on {}. Stop it first to change the address.", running.adapter)));
+        true
     }
 
     fn selected<'a>(&self, list: &'a [Adapter]) -> Option<&'a Adapter> {
@@ -346,7 +405,7 @@ impl App {
         self.address = p.address.clone();
         self.mask = p.mask.clone();
         self.gateway = p.gateway.clone();
-        if let Some(a) = p.adapter.filter(|a| list.iter().any(|x| &x.name == a)) {
+        if let Some(a) = p.adapter.filter(|a| self.dhcp.is_none() && list.iter().any(|x| &x.name == a)) {
             self.select_adapter(Some(a));
         }
     }
@@ -418,6 +477,9 @@ impl App {
             self.status = Some((Kind::Error, "Choose a network port first.".into()));
             return;
         };
+        if self.blocked_by_dhcp() {
+            return;
+        }
         let config = match ManualConfig::parse(&self.address, &self.mask, &self.gateway) {
             Ok(c) => c,
             Err(e) => {
@@ -439,6 +501,9 @@ impl App {
 
     fn use_dhcp(&mut self, adapter: Option<Adapter>) {
         let Some(adapter) = adapter else { return };
+        if self.blocked_by_dhcp() {
+            return;
+        }
         let done = format!("{} is back on DHCP (automatic).", adapter.name);
         self.start(format!("Switching {} to DHCP…", adapter.name), done, vec![], move || net::set_dhcp(&adapter));
     }
@@ -453,6 +518,99 @@ impl App {
             let _ = tx.send(work());
         });
         self.job = Some((rx, done, warnings));
+    }
+
+    fn parsed_dhcp(&self) -> Result<DhcpConfig, String> {
+        DhcpConfig::parse(&self.dhcp_server, &self.dhcp_mask, &self.dhcp_start, &self.dhcp_end, &self.dhcp_lease)
+    }
+
+    fn start_dhcp(&mut self, adapter: Option<Adapter>) {
+        if self.busy() || self.dhcp.is_some() {
+            return;
+        }
+        let Some(adapter) = adapter else {
+            self.status = Some((Kind::Error, "Choose a network port first.".into()));
+            return;
+        };
+        let config = match self.parsed_dhcp() {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = Some((Kind::Error, e));
+                return;
+            }
+        };
+        // An address from DHCP means a server already runs on this cable. A second one would fight it.
+        if let (Mode::Dhcp, Some(ip)) = (adapter.mode, adapter.address) {
+            if !ip.is_link_local() {
+                self.status = Some((
+                    Kind::Error,
+                    format!("{} already got {ip} from a DHCP server on this network. RackIP won't start a second one here, it would hand out conflicting addresses.", adapter.name),
+                ));
+                return;
+            }
+        }
+        self.store.dhcp_server = self.dhcp_server.trim().to_string();
+        self.store.dhcp_mask = self.dhcp_mask.trim().to_string();
+        self.store.dhcp_start = self.dhcp_start.trim().to_string();
+        self.store.dhcp_end = self.dhcp_end.trim().to_string();
+        self.store.dhcp_lease = self.dhcp_lease.trim().to_string();
+        self.store.save();
+
+        self.status = Some((Kind::Info, format!("Starting the DHCP server on {}…", adapter.name)));
+        let (tx, rx) = mpsc::channel();
+        let name = adapter.name.clone();
+        let c = config.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(net::start_dhcp(&adapter, &c));
+        });
+        self.dhcp_job = Some((rx, name, config));
+    }
+
+    fn stop_dhcp(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(running) = self.dhcp.take() else { return };
+        let done = format!("DHCP server stopped. {} keeps its address.", running.adapter);
+        self.start("Stopping the DHCP server…".into(), done, vec![], move || running.server.stop());
+    }
+
+    fn poll_dhcp(&mut self) {
+        if let Some((rx, name, config)) = &self.dhcp_job {
+            let result = match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("Starting the DHCP server was interrupted.".into())),
+            };
+            if let Some(result) = result {
+                match result {
+                    Ok(server) => {
+                        self.status = Some((
+                            Kind::Success,
+                            format!(
+                                "DHCP server running on {name} ({}/{}), handing out {} to {}.",
+                                config.server, config.prefix, config.start, config.end
+                            ),
+                        ));
+                        self.dhcp = Some(RunningDhcp { server, adapter: name.clone(), leases: Vec::new(), polled: Instant::now(), problem: None });
+                    }
+                    Err(e) => self.status = Some((Kind::Error, e)),
+                }
+                self.dhcp_job = None;
+                let _ = self.refresh.send(());
+            }
+        }
+        if let Some(running) = &mut self.dhcp {
+            if running.polled.elapsed() >= Duration::from_secs(1) {
+                running.leases = running.server.leases();
+                running.polled = Instant::now();
+                let problem = running.server.problem();
+                if problem.is_some() && problem != running.problem {
+                    self.status = Some((Kind::Warning, problem.clone().unwrap_or_default()));
+                }
+                running.problem = problem;
+            }
+        }
     }
 
     fn poll_job(&mut self) {
@@ -485,8 +643,11 @@ impl eframe::App for App {
         #[cfg(debug_assertions)]
         debug_screenshot(&ctx);
         self.poll_job();
+        self.poll_dhcp();
         if self.busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
+        } else if self.dhcp.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
 
         let (list, loaded, error) = {
@@ -507,16 +668,87 @@ impl eframe::App for App {
         let frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(18, 14));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-            self.port_section(ui, &list, selected.as_ref(), loaded, error.as_deref());
-            ui.add_space(14.0);
-            self.address_section(ui, &list);
-            ui.add_space(14.0);
-            self.footer(ui, selected);
+            self.tab_bar(ui);
+            ui.add_space(10.0);
+            egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| match self.tab {
+                Tab::StaticIp => {
+                    self.port_section(ui, &list, selected.as_ref(), loaded, error.as_deref());
+                    ui.add_space(14.0);
+                    self.address_section(ui, &list);
+                    ui.add_space(14.0);
+                    self.footer(ui, selected);
+                }
+                Tab::Dhcp => {
+                    self.port_section(ui, &list, selected.as_ref(), loaded, error.as_deref());
+                    ui.add_space(14.0);
+                    self.dhcp_section(ui);
+                    if self.dhcp.is_some() {
+                        ui.add_space(14.0);
+                        self.devices_section(ui);
+                    }
+                    ui.add_space(14.0);
+                    self.dhcp_footer(ui, selected);
+                }
+                Tab::About => self.about(ui),
+            });
         });
     }
 }
 
 impl App {
+    /// A segmented control, like the tab picker on macOS.
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let tabs = [(Tab::StaticIp, "Static IP"), (Tab::Dhcp, "DHCP Server"), (Tab::About, "About")];
+        let segment = egui::vec2(110.0, 28.0);
+        let total = egui::vec2(segment.x * tabs.len() as f32 + 4.0, segment.y + 4.0);
+        let (outer, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), total.y), egui::Sense::hover());
+        let bar = egui::Rect::from_center_size(outer.center(), total);
+        let dark = ui.visuals().dark_mode;
+        ui.painter().rect_filled(bar, 8, card_fill(ui));
+        for (i, (tab, label)) in tabs.into_iter().enumerate() {
+            let min = bar.min + egui::vec2(2.0 + segment.x * i as f32, 2.0);
+            let rect = egui::Rect::from_min_size(min, segment);
+            let response = ui.interact(rect, ui.scope_id().with(("tab", i)), egui::Sense::click());
+            let active = self.tab == tab;
+            if active {
+                let fill = if dark { Color32::from_gray(76) } else { Color32::WHITE };
+                ui.painter().rect_filled(rect, 6, fill);
+            } else if response.hovered() {
+                let fill = if dark { Color32::from_gray(56) } else { Color32::from_gray(228) };
+                ui.painter().rect_filled(rect, 6, fill);
+            }
+            let color = if active { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(14.0), color);
+            if response.clicked() {
+                self.tab = tab;
+            }
+        }
+    }
+
+    fn about(&mut self, ui: &mut egui::Ui) {
+        let icon = self.icon.get_or_insert_with(|| {
+            let data = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png")).unwrap_or_default();
+            let image = egui::ColorImage::from_rgba_unmultiplied([data.width as usize, data.height as usize], &data.rgba);
+            ui.ctx().load_texture("about-icon", image, egui::TextureOptions::LINEAR)
+        });
+        let icon = icon.clone();
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.add(egui::Image::new(&icon).fit_to_exact_size(egui::vec2(96.0, 96.0)));
+            ui.label(bold("RackIP", 20.0));
+            ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).weak());
+            ui.add_space(6.0);
+            ui.label("Switch your Ethernet port's IP address in one click.");
+            ui.add_space(14.0);
+            ui.label("Made by Mo Majnioui");
+            ui.hyperlink_to("majnioui.me", "https://majnioui.me");
+            ui.hyperlink_to("Source on GitHub", "https://github.com/majnioui/RackIP");
+            ui.add_space(14.0);
+            ui.label(RichText::new("Free and open source, MIT License").small().weak());
+        });
+    }
+
     fn port_section(&mut self, ui: &mut egui::Ui, list: &[Adapter], selected: Option<&Adapter>, loaded: bool, error: Option<&str>) {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
@@ -538,7 +770,7 @@ impl App {
             row(ui, true, "Port", |ui| {
                 let shown = selected.map(port_label).unwrap_or_else(|| if loaded { "No ports found".into() } else { "Looking for ports…".into() });
                 let mut choice = self.store.selected_adapter.clone();
-                egui::ComboBox::from_id_salt("port-combo")
+                ui.add_enabled_ui(self.dhcp.is_none(), |ui| egui::ComboBox::from_id_salt("port-combo")
                     .width(ui.available_width())
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
@@ -546,7 +778,9 @@ impl App {
                             ui.selectable_value(&mut choice, Some(a.name.clone()), port_label(a))
                                 .on_hover_text(&a.detail);
                         }
-                    });
+                    }))
+                    .response
+                    .on_disabled_hover_text("Stop the DHCP server to switch ports");
                 if choice != self.store.selected_adapter {
                     self.select_adapter(choice);
                 }
@@ -673,6 +907,123 @@ impl App {
         }
     }
 
+    fn dhcp_section(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(bold("DHCP server", 15.0));
+        });
+        let parsed = self.parsed_dhcp();
+        let defaults = DhcpConfig::parse(&self.dhcp_server, &self.dhcp_mask, "", "", "").ok();
+        let running = self.dhcp.is_some();
+        let mut submit = false;
+        card(ui, |ui| {
+            let mask_hint = defaults.as_ref().map(|c| c.mask().to_string()).unwrap_or_else(|| mask_from_prefix(DEFAULT_PREFIX).to_string());
+            let start_hint = defaults.as_ref().map(|c| c.start.to_string()).unwrap_or_default();
+            let end_hint = defaults.as_ref().map(|c| c.end.to_string()).unwrap_or_default();
+            let fields = [
+                ("Server address", &mut self.dhcp_server, dhcp::DEFAULT_SERVER.to_string()),
+                ("Subnet mask", &mut self.dhcp_mask, mask_hint),
+                ("Range start", &mut self.dhcp_start, start_hint),
+                ("Range end", &mut self.dhcp_end, end_hint),
+                ("Lease (min)", &mut self.dhcp_lease, dhcp::DEFAULT_LEASE_MINUTES.to_string()),
+            ];
+            for (i, (label, value, hint)) in fields.into_iter().enumerate() {
+                row(ui, i == 0, label, |ui| {
+                    let edit = egui::TextEdit::singleline(value)
+                        .hint_text(hint)
+                        .margin(egui::Margin::symmetric(8, 7))
+                        .desired_width(ui.available_width());
+                    let r = ui.add_enabled(!running, edit);
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                });
+            }
+            let (text, is_error) = match &parsed {
+                Err(e) => (e.clone(), true),
+                Ok(c) => {
+                    let extra = if cfg!(target_os = "linux") {
+                        "NetworkManager also offers this computer as gateway and DNS, and shares its internet connection."
+                    } else {
+                        "No gateway or DNS is handed out, so they only reach this computer."
+                    };
+                    (format!("The port gets {}/{}. Devices on the cable get {} to {}. {extra}", c.server, c.prefix, c.start, c.end), false)
+                }
+            };
+            let y = ui.cursor().top();
+            let color = if ui.visuals().dark_mode { Color32::from_gray(58) } else { Color32::from_gray(222) };
+            ui.painter().hline(ui.max_rect().x_range(), y, egui::Stroke::new(1.0, color));
+            ui.add_space(9.0);
+            let text = RichText::new(text).small();
+            ui.add(egui::Label::new(if is_error { text.color(RED) } else { text.weak() }).wrap());
+            ui.add_space(9.0);
+        });
+        if submit && !running && !self.busy() {
+            let list = self.ports.lock().unwrap().list.clone();
+            let selected = self.selected(&list).cloned();
+            self.start_dhcp(selected);
+        }
+    }
+
+    fn devices_section(&mut self, ui: &mut egui::Ui) {
+        let Some(running) = &self.dhcp else { return };
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(bold("Devices", 15.0));
+        });
+        let leases = running.leases.clone();
+        card(ui, |ui| {
+            if leases.is_empty() {
+                ui.add_space(10.0);
+                ui.add(egui::Label::new(RichText::new("Waiting for devices. Plug one in, or restart its network so it asks for an address.").weak()).wrap());
+                ui.add_space(10.0);
+            }
+            let now = store::now();
+            for (i, lease) in leases.iter().enumerate() {
+                if i > 0 {
+                    let y = ui.cursor().top();
+                    let color = if ui.visuals().dark_mode { Color32::from_gray(58) } else { Color32::from_gray(222) };
+                    ui.painter().hline(ui.max_rect().x_range(), y, egui::Stroke::new(1.0, color));
+                }
+                ui.add_space(7.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.add(egui::Label::new(RichText::new(lease.ip.to_string()).strong()).selectable(true));
+                        let detail = if lease.hostname.is_empty() { lease.mac.clone() } else { format!("{} · {}", lease.hostname, lease.mac) };
+                        ui.add(egui::Label::new(RichText::new(detail).small().weak()).selectable(true));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(expires_text(lease.expires, now)).small().weak());
+                    });
+                });
+                ui.add_space(7.0);
+            }
+        });
+    }
+
+    fn dhcp_footer(&mut self, ui: &mut egui::Ui, selected: Option<Adapter>) {
+        let running = self.dhcp.is_some();
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if running {
+                    if ui.add_enabled(!self.busy(), egui::Button::new("Stop").min_size(egui::vec2(80.0, 0.0))).clicked() {
+                        self.stop_dhcp();
+                    }
+                } else {
+                    let enabled = !self.busy() && selected.is_some();
+                    if accent_button(ui, enabled, "Start").clicked() {
+                        self.start_dhcp(selected.clone());
+                    }
+                }
+                if self.busy() {
+                    ui.spinner();
+                }
+            });
+        });
+        self.status_line(ui);
+    }
+
     fn footer(&mut self, ui: &mut egui::Ui, selected: Option<Adapter>) {
         let enabled = !self.busy() && selected.is_some();
         ui.horizontal(|ui| {
@@ -680,17 +1031,7 @@ impl App {
                 self.use_dhcp(selected.clone());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let apply = ui.scope(|ui| {
-                    let w = &mut ui.visuals_mut().widgets;
-                    w.inactive.weak_bg_fill = ACCENT;
-                    w.inactive.bg_stroke = egui::Stroke::NONE;
-                    w.hovered.weak_bg_fill = ACCENT_HOVER;
-                    w.hovered.bg_stroke = egui::Stroke::NONE;
-                    w.active.weak_bg_fill = ACCENT_HOVER;
-                    let button = egui::Button::new(RichText::new("Apply").color(Color32::WHITE)).min_size(egui::vec2(80.0, 0.0));
-                    ui.add_enabled(enabled, button)
-                });
-                if apply.inner.clicked() {
+                if accent_button(ui, enabled, "Apply").clicked() {
                     self.apply(selected.clone());
                 }
                 if ui.add_enabled(enabled, egui::Button::new("Save")).on_hover_text("Save this address without applying it").clicked() {
@@ -702,6 +1043,10 @@ impl App {
             });
         });
 
+        self.status_line(ui);
+    }
+
+    fn status_line(&self, ui: &mut egui::Ui) {
         if let Some((kind, text)) = &self.status {
             let (icon, color) = match kind {
                 Kind::Info => ("…", ui.visuals().weak_text_color()),
@@ -712,6 +1057,33 @@ impl App {
             ui.add_space(2.0);
             ui.add(egui::Label::new(RichText::new(format!("{icon} {text}")).color(color)).wrap());
         }
+    }
+}
+
+/// The blue default button.
+fn accent_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = ACCENT;
+        w.inactive.bg_stroke = egui::Stroke::NONE;
+        w.hovered.weak_bg_fill = ACCENT_HOVER;
+        w.hovered.bg_stroke = egui::Stroke::NONE;
+        w.active.weak_bg_fill = ACCENT_HOVER;
+        let button = egui::Button::new(RichText::new(label).color(Color32::WHITE)).min_size(egui::vec2(80.0, 0.0));
+        ui.add_enabled(enabled, button)
+    })
+    .inner
+}
+
+fn expires_text(expires: u64, now: u64) -> String {
+    if expires == u64::MAX {
+        return "no expiry".into();
+    }
+    let minutes = expires.saturating_sub(now).div_ceil(60);
+    if minutes >= 120 {
+        format!("{} h left", minutes / 60)
+    } else {
+        format!("{minutes} min left")
     }
 }
 

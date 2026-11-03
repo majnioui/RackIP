@@ -32,6 +32,10 @@ struct MenuBarContent: View {
         } else {
             Text("No port selected")
         }
+        if let dhcp = model.dhcpServiceName {
+            Text("DHCP server on \(dhcp) · \(model.dhcpLeases.count) device\(model.dhcpLeases.count == 1 ? "" : "s")")
+            Button("Stop DHCP Server") { model.stopDHCP() }
+        }
         Divider()
 
         if model.profiles.isEmpty {

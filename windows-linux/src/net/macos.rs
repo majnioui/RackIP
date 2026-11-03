@@ -1,7 +1,12 @@
 //! Development only: lets the cross-platform UI run on a Mac. The macOS
 //! release is the Swift app at the repository root.
 
-use super::{run, Adapter, Mode};
+use super::{run, Adapter, DhcpServer, Mode};
+use crate::dhcp::DhcpConfig;
+
+pub fn start_dhcp(_adapter: &Adapter, _config: &DhcpConfig) -> Result<Box<dyn DhcpServer>, String> {
+    Err("On macOS, the DHCP server is in the RackIP Mac app.".into())
+}
 use crate::config::{parse_ipv4, prefix_from_mask, ManualConfig};
 
 const TOOL: &str = "/usr/sbin/networksetup";

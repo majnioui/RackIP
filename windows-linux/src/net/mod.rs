@@ -1,6 +1,8 @@
-//! The operating system side: list ports, set a static address, go back to DHCP.
+//! The operating system side: list ports, set a static address, go back to
+//! DHCP, run a DHCP server.
 
 use crate::config::ManualConfig;
+use crate::dhcp::{DhcpConfig, Lease};
 use std::net::Ipv4Addr;
 use std::process::Command;
 
@@ -57,6 +59,30 @@ pub fn set_static(adapter: &Adapter, config: &ManualConfig) -> Result<(), String
 
 pub fn set_dhcp(adapter: &Adapter) -> Result<(), String> {
     platform::set_dhcp(adapter)
+}
+
+/// A running DHCP server on one port.
+pub trait DhcpServer: Send {
+    /// Devices holding an address now.
+    fn leases(&mut self) -> Vec<Lease>;
+    /// Something the user should know while it runs.
+    fn problem(&self) -> Option<String>;
+    /// Stops serving. The port keeps the server address.
+    fn stop(self: Box<Self>) -> Result<(), String>;
+}
+
+/// Gives the port the server address and starts handing out the range.
+pub fn start_dhcp(adapter: &Adapter, config: &DhcpConfig) -> Result<Box<dyn DhcpServer>, String> {
+    platform::start_dhcp(adapter, config)
+}
+
+/// The server address as a static configuration for the port itself.
+pub(crate) fn server_address(config: &DhcpConfig) -> ManualConfig {
+    ManualConfig { address: config.server, prefix: config.prefix, gateway: None, warnings: Vec::new() }
+}
+
+pub(crate) fn foreign_server_message(server: Ipv4Addr) -> String {
+    format!("Another DHCP server ({server}) answered on this cable. RackIP stopped handing out addresses so the two don't conflict.")
 }
 
 /// Runs a tool and returns stdout, or its output as the error message.

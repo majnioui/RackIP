@@ -2,17 +2,47 @@ import SwiftUI
 import RackIPCore
 
 struct ContentView: View {
+    enum Tab: String, CaseIterable, Identifiable {
+        case staticIP = "Static IP"
+        case dhcp = "DHCP Server"
+        case about = "About"
+        var id: Self { self }
+    }
+
     @EnvironmentObject var model: AppModel
+    @State private var tab: Tab = .staticIP
 
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                portSection
-                addressSection
+            Picker("View", selection: $tab) {
+                ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
             }
-            .formStyle(.grouped)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .padding(.top, 14)
 
-            footer
+            switch tab {
+            case .staticIP:
+                Form {
+                    portSection
+                    addressSection
+                }
+                .formStyle(.grouped)
+
+                footer
+            case .dhcp:
+                Form {
+                    portSection
+                    dhcpSection
+                    if model.isDHCPRunning { devicesSection }
+                }
+                .formStyle(.grouped)
+
+                dhcpFooter
+            case .about:
+                AboutView()
+            }
         }
         .frame(width: 460)
         .fixedSize(horizontal: false, vertical: true)
@@ -27,6 +57,8 @@ struct ContentView: View {
                     Text(portLabel(s)).tag(Optional(s.name))
                 }
             }
+            .disabled(model.isDHCPRunning)
+            .help(model.isDHCPRunning ? "Stop the DHCP server to switch ports" : "")
             LabeledContent("Current") {
                 HStack(spacing: 6) {
                     if let s = model.selectedService {
@@ -132,6 +164,77 @@ struct ContentView: View {
         }
     }
 
+    // MARK: DHCP server
+
+    private var dhcpSection: some View {
+        Section("DHCP server") {
+            let defaults = model.dhcpDefaults
+            TextField("Server address", text: $model.dhcpServer, prompt: Text(DHCPConfig.defaultServer.description))
+            TextField("Subnet mask", text: $model.dhcpMask, prompt: Text(defaults?.mask.description ?? ManualConfig.defaultMask.description))
+            TextField("Range start", text: $model.dhcpRangeStart, prompt: Text(defaults?.rangeStart.description ?? ""))
+            TextField("Range end", text: $model.dhcpRangeEnd, prompt: Text(defaults?.rangeEnd.description ?? ""))
+            TextField("Lease (minutes)", text: $model.dhcpLeaseMinutes, prompt: Text(String(DHCPConfig.defaultLeaseMinutes)))
+
+            Group {
+                switch model.parsedDHCP {
+                case .failure(let e):
+                    Text(e.description).foregroundStyle(.red)
+                case .success(let c):
+                    Text(verbatim: "The port gets \(c.server)/\(c.prefix). Devices on the cable get \(c.rangeStart) to \(c.rangeEnd). No gateway or DNS is handed out, so they only reach this Mac.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .disabled(model.isDHCPRunning)
+    }
+
+    private var devicesSection: some View {
+        Section("Devices") {
+            if model.dhcpLeases.isEmpty {
+                Text("Waiting for devices. Plug one in, or restart its network so it asks for an address.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(model.dhcpLeases) { lease in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(lease.ip.description)
+                            .font(.body.monospacedDigit())
+                        Text([lease.hostname ?? lease.vendor, lease.mac].compactMap { $0 }.joined(separator: " · "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .textSelection(.enabled)
+                    Spacer()
+                    Text("until \(lease.expires, style: .time)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var dhcpFooter: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Spacer()
+                if model.isBusy { ProgressView().controlSize(.small) }
+                if model.isDHCPRunning {
+                    Button("Stop") { model.stopDHCP() }
+                } else {
+                    Button("Start") { model.startDHCP() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(model.isBusy || model.selectedService == nil)
+                }
+            }
+            statusLabel
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 16)
+    }
+
     // MARK: Footer
 
     private var footer: some View {
@@ -148,16 +251,21 @@ struct ContentView: View {
             }
             .disabled(model.isBusy || model.selectedService == nil)
 
-            if let status = model.status {
-                Label(status.text, systemImage: icon(status.kind))
-                    .font(.callout)
-                    .foregroundStyle(color(status.kind))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            statusLabel
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 16)
+    }
+
+    @ViewBuilder
+    private var statusLabel: some View {
+        if let status = model.status {
+            Label(status.text, systemImage: icon(status.kind))
+                .font(.callout)
+                .foregroundStyle(color(status.kind))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private func icon(_ kind: AppModel.Status.Kind) -> String {
